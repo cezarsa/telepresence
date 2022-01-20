@@ -17,7 +17,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
 	empty "google.golang.org/protobuf/types/known/emptypb"
-	"k8s.io/apimachinery/pkg/labels"
+	core "k8s.io/api/core/v1"
 
 	"github.com/datawire/dlib/dcontext"
 	"github.com/datawire/dlib/dgroup"
@@ -59,7 +59,7 @@ type Session interface {
 	Uninstall(context.Context, *rpc.UninstallRequest) (*rpc.UninstallResult, error)
 	UpdateStatus(context.Context, *rpc.ConnectRequest) *rpc.ConnectInfo
 	WithK8sInterface(context.Context) context.Context
-	WorkloadInfoSnapshot(context.Context, *rpc.ListRequest) *rpc.WorkloadInfoSnapshot
+	WorkloadInfoSnapshot(context.Context, *rpc.ListRequest) (*rpc.WorkloadInfoSnapshot, error)
 	ManagerClient() manager.ManagerClient
 }
 
@@ -99,6 +99,8 @@ type TrafficManager struct {
 	// Map of mutexes, so that we don't create and delete
 	// mount points concurrently
 	mountMutexes sync.Map
+
+	wlWatcher *workloadsAndServicesWatcher
 
 	insLock sync.Mutex
 
@@ -337,6 +339,7 @@ func connectMgr(c context.Context, cluster *k8s.Cluster, installID string, svc S
 		sessionInfo:     si,
 		rootDaemon:      rootDaemon,
 		localIntercepts: map[string]string{},
+		wlWatcher:       newWASWatcher(),
 	}, nil
 }
 
@@ -358,6 +361,8 @@ func (tm *TrafficManager) setInterceptedNamespaces(c context.Context, intercepte
 // updateDaemonNamespacesLocked will create a new DNS search path from the given namespaces and
 // send it to the DNS-resolver in the daemon.
 func (tm *TrafficManager) updateDaemonNamespaces(c context.Context) {
+	tm.wlWatcher.setNamespacesToWatch(c, tm.GetCurrentNamespaces(true))
+
 	tm.insLock.Lock()
 	namespaces := make([]string, 0, len(tm.interceptedNamespaces)+len(tm.localIntercepts))
 	for ns := range tm.interceptedNamespaces {
@@ -374,7 +379,7 @@ func (tm *TrafficManager) updateDaemonNamespaces(c context.Context) {
 
 	// Pass current mapped namespaces as plain names (no ending dot). The DNS-resolver will
 	// create special mapping for those, allowing names like myservice.mynamespace to be resolved
-	paths := tm.GetCurrentNamespaces()
+	paths := tm.GetCurrentNamespaces(false)
 	dlog.Debugf(c, "posting search paths %v and namespaces %v", paths, namespaces)
 	if _, err := tm.rootDaemon.SetDnsSearchPath(c, &daemon.Paths{Paths: paths, Namespaces: namespaces}); err != nil {
 		dlog.Errorf(c, "error posting search paths %v and namespaces %v to root daemon: %v", paths, namespaces, err)
@@ -385,7 +390,7 @@ func (tm *TrafficManager) updateDaemonNamespaces(c context.Context) {
 // Run (1) starts up with ensuring that the manager is installed and running,
 // but then for most of its life
 //  - (2) calls manager.ArriveAsClient and then periodically calls manager.Remain
-//  - watch the intercepts (manager.WatchIntercepts) and then
+//  - run the intercepts (manager.WatchIntercepts) and then
 //    + (3) listen on the appropriate local ports and forward them to the intercepted
 //      Services, and
 //    + (4) mount the appropriate remote volumes.
@@ -408,97 +413,51 @@ func (tm *TrafficManager) session() *manager.SessionInfo {
 	return tm.sessionInfo
 }
 
-// hasOwner parses an object and determines whether the object has an
-// owner that is of a kind we prefer. Currently the only owner that we
-// prefer is a Deployment, but this may grow in the future
-func (tm *TrafficManager) hasOwner(obj k8sapi.Object) bool {
-	for _, owner := range obj.GetOwnerReferences() {
-		if owner.Kind == "Deployment" {
-			return true
-		}
-	}
-	return false
-}
-
-// getReasonAndLabels gets the workload's associated labels, as well as a reason
-// it cannot be intercepted if that is the case.
-func (tm *TrafficManager) getReasonAndLabels(workload k8sapi.Workload) (labels map[string]string, reason string) {
-	labels = workload.GetPodTemplate().Labels
-	if workload.Replicas() == 0 {
-		reason = "Has 0 replicas"
-	}
-	return
-}
-
-// getInfosForWorkload creates a WorkloadInfo for every workload in names
-// of the given objectKind.  Additionally, it uses information about the
-// filter param, which is configurable, to decide which workloads to add
-// or ignore based on the filter criteria.
+// getInfosForWorkloads returns a list of workloads found in the given namespace that fulfils the given filter criteria.
 func (tm *TrafficManager) getInfosForWorkloads(
 	ctx context.Context,
-	workloads []k8sapi.Workload,
 	namespace string,
 	iMap map[string]*manager.InterceptInfo,
 	aMap map[string]*manager.AgentInfo,
 	filter rpc.ListRequest_Filter,
-) []*rpc.WorkloadInfo {
-	workloadInfos := make([]*rpc.WorkloadInfo, 0)
-	for _, workload := range workloads {
-		name := workload.GetName()
-		dlog.Debugf(ctx, "Getting info for %s %s.%s", workload.GetKind(), name, workload.GetNamespace())
-		iCept, ok := iMap[name]
-		if !ok && filter <= rpc.ListRequest_INTERCEPTS {
-			continue
+) ([]*rpc.WorkloadInfo, error) {
+	wis := make([]*rpc.WorkloadInfo, 0)
+	var err error
+	tm.wlWatcher.eachService(ctx, namespace, func(svc *core.Service) {
+		var wls []k8sapi.Workload
+		if wls, err = tm.wlWatcher.findMatchingWorkloads(ctx, svc); err != nil {
+			return
 		}
-		agent, ok := aMap[name]
-		if !ok && filter <= rpc.ListRequest_INSTALLED_AGENTS {
-			continue
-		}
-		reason := ""
-		if agent == nil && iCept == nil {
-			labels, reason := tm.getReasonAndLabels(workload)
-			if reason == "" {
-				// If an object is owned by a higher level workload, then users should
-				// intercept that workload, so we will not include it in our slice.
-				if tm.hasOwner(workload) {
-					continue
-				}
-
-				matchingSvcs, err := install.FindMatchingServices(ctx, "", "", namespace, labels)
-				if err != nil {
-					continue
-				}
-				if len(matchingSvcs) == 0 {
-					reason = "No service with matching selector"
-				}
+		for _, workload := range wls {
+			name := workload.GetName()
+			dlog.Debugf(ctx, "Getting info for %s %s.%s, matching service %s.%s", workload.GetKind(), name, workload.GetNamespace(), svc.Name, svc.Namespace)
+			wlInfo := &rpc.WorkloadInfo{
+				Name:                 name,
+				WorkloadResourceType: workload.GetKind(),
 			}
-
-			// If we have a reason, that means it's not interceptable, so we only
-			// pass the workload through if they want to see all workloads, not
-			// just the interceptable ones
-			if filter <= rpc.ListRequest_INTERCEPTABLE && reason != "" {
+			var ok bool
+			wlInfo.InterceptInfo, ok = iMap[name]
+			if !ok && filter <= rpc.ListRequest_INTERCEPTS {
 				continue
 			}
+			wlInfo.AgentInfo, ok = aMap[name]
+			if !ok && filter <= rpc.ListRequest_INSTALLED_AGENTS {
+				continue
+			}
+			wis = append(wis, wlInfo)
 		}
-
-		workloadInfos = append(workloadInfos, &rpc.WorkloadInfo{
-			Name:                   name,
-			NotInterceptableReason: reason,
-			AgentInfo:              agent,
-			InterceptInfo:          iCept,
-			WorkloadResourceType:   workload.GetKind(),
-		})
-	}
-	return workloadInfos
+	})
+	sort.Slice(wis, func(i, j int) bool { return wis[i].Name < wis[j].Name })
+	return wis, nil
 }
 
-func (tm *TrafficManager) WorkloadInfoSnapshot(ctx context.Context, rq *rpc.ListRequest) *rpc.WorkloadInfoSnapshot {
+func (tm *TrafficManager) WorkloadInfoSnapshot(ctx context.Context, rq *rpc.ListRequest) (*rpc.WorkloadInfoSnapshot, error) {
 	var iMap map[string]*manager.InterceptInfo
 
 	namespace := tm.ActualNamespace(rq.Namespace)
 	if namespace == "" {
 		// namespace is not currently mapped
-		return &rpc.WorkloadInfoSnapshot{}
+		return &rpc.WorkloadInfoSnapshot{}, nil
 	}
 
 	is := tm.getCurrentIntercepts()
@@ -510,25 +469,9 @@ func (tm *TrafficManager) WorkloadInfoSnapshot(ctx context.Context, rq *rpc.List
 	}
 	aMap := tm.getCurrentAgentsInNamespace(namespace)
 	filter := rq.Filter
-	workloadInfos := make([]*rpc.WorkloadInfo, 0)
-
-	// These are all the workloads we care about and their associated function
-	// to get the names of those workloads
-	workloadsToGet := map[string]func(context.Context, string, labels.Set) ([]k8sapi.Workload, error){
-		"Deployment":  k8sapi.Deployments,
-		"ReplicaSet":  k8sapi.ReplicaSets,
-		"StatefulSet": k8sapi.StatefulSets,
-	}
-
-	for workloadKind, getFunc := range workloadsToGet {
-		workloads, err := getFunc(ctx, namespace, nil)
-		if err != nil {
-			dlog.Error(ctx, err)
-			dlog.Infof(ctx, "Skipping getting info for workloads: %s", workloadKind)
-			continue
-		}
-		newWorkloadInfos := tm.getInfosForWorkloads(ctx, workloads, namespace, iMap, aMap, filter)
-		workloadInfos = append(workloadInfos, newWorkloadInfos...)
+	workloadInfos, err := tm.getInfosForWorkloads(ctx, namespace, iMap, aMap, filter)
+	if err != nil {
+		return nil, err
 	}
 
 	for localIntercept, localNs := range tm.localIntercepts {
@@ -541,7 +484,7 @@ func (tm *TrafficManager) WorkloadInfoSnapshot(ctx context.Context, rq *rpc.List
 		}
 	}
 
-	return &rpc.WorkloadInfoSnapshot{Workloads: workloadInfos}
+	return &rpc.WorkloadInfoSnapshot{Workloads: workloadInfos}, nil
 }
 
 func (tm *TrafficManager) remain(c context.Context) error {

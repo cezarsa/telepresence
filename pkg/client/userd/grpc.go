@@ -51,7 +51,7 @@ func (s *service) logCall(c context.Context, callName string, f func(context.Con
 	f(c)
 }
 
-func (s *service) withSession(c context.Context, callName string, f func(context.Context, trafficmgr.Session)) (err error) {
+func (s *service) withSession(c context.Context, callName string, f func(context.Context, trafficmgr.Session) error) (err error) {
 	s.logCall(c, callName, func(ctx context.Context) {
 		s.sessionLock.RLock()
 		defer s.sessionLock.RUnlock()
@@ -60,7 +60,7 @@ func (s *service) withSession(c context.Context, callName string, f func(context
 			return
 		}
 		defer func() { err = callRecovery(recover(), err) }()
-		f(s.session.WithK8sInterface(c), s.session)
+		err = f(s.session.WithK8sInterface(c), s.session)
 	})
 	return
 }
@@ -123,7 +123,7 @@ func (s *service) Status(c context.Context, _ *empty.Empty) (result *rpc.Connect
 }
 
 func (s *service) CanIntercept(c context.Context, ir *rpc.CreateInterceptRequest) (result *rpc.InterceptResult, err error) {
-	err = s.withSession(c, "CanIntercept", func(c context.Context, session trafficmgr.Session) {
+	err = s.withSession(c, "CanIntercept", func(c context.Context, session trafficmgr.Session) error {
 		var wl k8sapi.Workload
 		if result, wl = session.CanIntercept(c, ir); result == nil {
 			var kind string
@@ -135,21 +135,23 @@ func (s *service) CanIntercept(c context.Context, ir *rpc.CreateInterceptRequest
 				WorkloadKind: kind,
 			}
 		}
+		return nil
 	})
 	return
 }
 
 func (s *service) CreateIntercept(c context.Context, ir *rpc.CreateInterceptRequest) (result *rpc.InterceptResult, err error) {
-	err = s.withSession(c, "CreateIntercept", func(c context.Context, session trafficmgr.Session) {
+	err = s.withSession(c, "CreateIntercept", func(c context.Context, session trafficmgr.Session) error {
 		result, err = session.AddIntercept(c, ir)
+		return err
 	})
 	return
 }
 
 func (s *service) RemoveIntercept(c context.Context, rr *manager.RemoveInterceptRequest2) (result *rpc.InterceptResult, err error) {
-	err = s.withSession(c, "RemoveIntercept", func(c context.Context, session trafficmgr.Session) {
+	err = s.withSession(c, "RemoveIntercept", func(c context.Context, session trafficmgr.Session) error {
 		result = &rpc.InterceptResult{}
-		if err = session.RemoveIntercept(c, rr.Name); err != nil {
+		if err := session.RemoveIntercept(c, rr.Name); err != nil {
 			if grpcStatus.Code(err) == grpcCodes.NotFound {
 				result.Error = rpc.InterceptError_NOT_FOUND
 				result.ErrorText = rr.Name
@@ -160,20 +162,23 @@ func (s *service) RemoveIntercept(c context.Context, rr *manager.RemoveIntercept
 				result.ErrorCategory = int32(errcat.Unknown)
 			}
 		}
+		return nil
 	})
 	return
 }
 
 func (s *service) List(c context.Context, lr *rpc.ListRequest) (result *rpc.WorkloadInfoSnapshot, err error) {
-	err = s.withSession(c, "List", func(c context.Context, session trafficmgr.Session) {
-		result = session.WorkloadInfoSnapshot(c, lr)
+	err = s.withSession(c, "List", func(c context.Context, session trafficmgr.Session) error {
+		result, err = session.WorkloadInfoSnapshot(c, lr)
+		return err
 	})
 	return
 }
 
 func (s *service) Uninstall(c context.Context, ur *rpc.UninstallRequest) (result *rpc.UninstallResult, err error) {
-	err = s.withSession(c, "Uninstall", func(c context.Context, session trafficmgr.Session) {
+	err = s.withSession(c, "Uninstall", func(c context.Context, session trafficmgr.Session) error {
 		result, err = session.Uninstall(c, ur)
+		return err
 	})
 	return
 }
@@ -268,11 +273,12 @@ func (s *service) GetCloudLicense(ctx context.Context, req *rpc.LicenseRequest) 
 }
 
 func (s *service) GetIngressInfos(c context.Context, _ *empty.Empty) (result *rpc.IngressInfos, err error) {
-	err = s.withSession(c, "GetIngressInfos", func(c context.Context, session trafficmgr.Session) {
+	err = s.withSession(c, "GetIngressInfos", func(c context.Context, session trafficmgr.Session) error {
 		var iis []*manager.IngressInfo
 		if iis, err = session.IngressInfos(c); err == nil {
 			result = &rpc.IngressInfos{IngressInfos: iis}
 		}
+		return err
 	})
 	return
 }

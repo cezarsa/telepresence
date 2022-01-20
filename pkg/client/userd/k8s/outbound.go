@@ -73,6 +73,11 @@ func (kc *Cluster) canAccessNS(c context.Context, authHandler typedAuth.SelfSubj
 		},
 		{
 			Namespace: namespace,
+			Verb:      "watch",
+			Resource:  "deployments",
+		},
+		{
+			Namespace: namespace,
 			Verb:      "get",
 			Resource:  "deployments",
 		},
@@ -87,7 +92,7 @@ func (kc *Cluster) canAccessNS(c context.Context, authHandler typedAuth.SelfSubj
 			return false
 		}
 		if !ar.Status.Allowed {
-			dlog.Debugf(c, "namespace %q is not accessible", namespace)
+			dlog.Infof(c, "Namespace %q is not accessible. Doing %q on %q is not allowed", namespace, ra.Verb, ra.Resource)
 			return false
 		}
 	}
@@ -135,14 +140,21 @@ func (kc *Cluster) SetNamespaceListener(nsListener func(context.Context)) {
 
 func (kc *Cluster) refreshNamespaces(c context.Context) {
 	kc.nsLock.Lock()
-	namespaces := make([]string, 0, len(kc.currentNamespaces))
+	namespaces := make(map[string]bool, len(kc.currentNamespaces))
 	for ns, ok := range kc.currentNamespaces {
 		if ok && kc.shouldBeWatched(ns) {
-			namespaces = append(namespaces, ns)
+			namespaces[ns] = ok
 		}
 	}
-	sort.Strings(namespaces)
-	equal := sortedStringSlicesEqual(namespaces, kc.currentMappedNamespaces)
+	equal := len(namespaces) == len(kc.currentMappedNamespaces)
+	if equal {
+		for k, ov := range kc.currentMappedNamespaces {
+			if nv, ok := namespaces[k]; !ok || nv != ov {
+				equal = false
+				break
+			}
+		}
+	}
 	if !equal {
 		kc.currentMappedNamespaces = namespaces
 	}
