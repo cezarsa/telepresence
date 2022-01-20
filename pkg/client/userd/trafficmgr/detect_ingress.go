@@ -4,10 +4,8 @@ import (
 	"context"
 
 	core "k8s.io/api/core/v1"
-	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/telepresenceio/telepresence/rpc/v2/manager"
-	"github.com/telepresenceio/telepresence/v2/pkg/k8sapi"
 )
 
 func (tm *TrafficManager) IngressInfos(c context.Context) ([]*manager.IngressInfo, error) {
@@ -17,10 +15,7 @@ func (tm *TrafficManager) IngressInfos(c context.Context) ([]*manager.IngressInf
 	ingressInfo := tm.ingressInfo
 	if ingressInfo == nil {
 		tm.insLock.Unlock()
-		ingressInfo, err := tm.detectIngressBehavior(c)
-		if err != nil {
-			return nil, err
-		}
+		ingressInfo := tm.detectIngressBehavior(c)
 		tm.insLock.Lock()
 		tm.ingressInfo = ingressInfo
 	}
@@ -29,11 +24,8 @@ func (tm *TrafficManager) IngressInfos(c context.Context) ([]*manager.IngressInf
 	return is, nil
 }
 
-func (tm *TrafficManager) detectIngressBehavior(c context.Context) ([]*manager.IngressInfo, error) {
-	loadBalancers, err := tm.findAllSvcByType(c, core.ServiceTypeLoadBalancer)
-	if err != nil {
-		return nil, err
-	}
+func (tm *TrafficManager) detectIngressBehavior(c context.Context) []*manager.IngressInfo {
+	loadBalancers := tm.findAllSvcByType(c, core.ServiceTypeLoadBalancer)
 	type portFilter func(p *core.ServicePort) bool
 	findTCPPort := func(ports []core.ServicePort, filter portFilter) *core.ServicePort {
 		for i := range ports {
@@ -74,38 +66,36 @@ func (tm *TrafficManager) detectIngressBehavior(c context.Context) ([]*manager.I
 			Port:   port.Port,
 		})
 	}
-	return iis, nil
+	return iis
 }
 
 // findAllSvcByType finds services with the given service type in all namespaces of the cluster returns
 // a slice containing a copy of those services.
-func (tm *TrafficManager) findAllSvcByType(c context.Context, svcType core.ServiceType) ([]*core.Service, error) {
-	// NOTE: This is expensive in terms of bandwidth on a large cluster. We currently only use this
-	// to retrieve ingress info and that task could be moved to the traffic-manager instead.
-	var typedSvcs []*core.Service
-	findTyped := func(ns string) error {
-		ss, err := k8sapi.GetK8sInterface(c).CoreV1().Services(ns).List(c, meta.ListOptions{})
-		if err != nil {
-			return err
-		}
-		for i := range ss.Items {
-			s := &ss.Items[i]
-			if s.Spec.Type == svcType {
-				typedSvcs = append(typedSvcs, s)
+func (tm *TrafficManager) findAllSvcByType(c context.Context, svcType core.ServiceType) []*core.Service {
+	var services []*core.Service
+	checked := map[string]struct{}{}
+
+	findLB := func(ns string) {
+		tm.wlWatcher.eachService(c, ns, func(wi *core.Service) {
+			if wi.Spec.Type == svcType {
+				services = append(services, wi)
 			}
-		}
-		return nil
+		})
 	}
 
-	mns := tm.GetCurrentNamespaces()
-	if len(mns) > 0 {
-		for _, ns := range mns {
-			if err := findTyped(ns); err != nil {
-				return nil, err
+	// Favor namespaces where the user has access
+	for _, ns := range tm.GetCurrentNamespaces(true) {
+		checked[ns] = struct{}{}
+		findLB(ns)
+	}
+	if len(services) == 0 {
+		// No ingress found in accessible namespaces. Let's try the ones where user don't have access
+		// because user might not have access to the namespace where the load balancer resides
+		for _, ns := range tm.GetCurrentNamespaces(false) {
+			if _, ok := checked[ns]; !ok {
+				findLB(ns)
 			}
 		}
-	} else if err := findTyped(""); err != nil {
-		return nil, err
 	}
-	return typedSvcs, nil
+	return services
 }
