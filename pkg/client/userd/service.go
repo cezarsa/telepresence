@@ -48,9 +48,9 @@ type parsedConnectRequest struct {
 	*k8s.Config
 }
 
-type WithSession func(c context.Context, callName string, f func(context.Context, trafficmgr.Session)) (err error)
+type WithSession func(c context.Context, callName string, f func(context.Context, trafficmgr.Session) error) (err error)
 
-// A daemon service is one that runs during the entire lifecycle of the daemon.
+// A DaemonService is one that runs during the entire lifecycle of the daemon.
 // This should be used to augment the daemon with GRPC services.
 type DaemonService interface {
 	Name() string
