@@ -200,7 +200,7 @@ func (w *workloadsAndServicesWatcher) eachService(c context.Context, namespace s
 
 // subscribe writes to the given channel whenever relevant information has changed
 // in the current snapshot
-func (w *workloadsAndServicesWatcher) subscribe(c context.Context) chan<- struct{} {
+func (w *workloadsAndServicesWatcher) subscribe(c context.Context) <-chan struct{} {
 	ch := make(chan struct{})
 	go func() {
 		w.Lock()

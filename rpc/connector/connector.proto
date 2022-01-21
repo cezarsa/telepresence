@@ -47,6 +47,9 @@ service Connector {
   // Requires having already called Connect.
   rpc List(ListRequest) returns (WorkloadInfoSnapshot);
 
+  // Watch all workloads in the mapped namespaces
+  rpc WatchWorkloads(google.protobuf.Empty) returns (stream WorkloadInfoSnapshot);
+
   // Returns a stream of messages to display to the user.  Does NOT
   // require having called anything else first.
   rpc UserNotifications(google.protobuf.Empty) returns (stream Notification);
@@ -235,6 +238,9 @@ message ListRequest {
 message WorkloadInfo {
   // Name of workload
   string name = 1;
+
+  // Namespace of workload
+  string namespace = 6;
 
   // Reason why workload cannot be intercepted, or empty if it can.
   string not_interceptable_reason = 2;

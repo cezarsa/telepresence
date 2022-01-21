@@ -58,6 +58,7 @@ type Session interface {
 	Run(context.Context) error
 	Uninstall(context.Context, *rpc.UninstallRequest) (*rpc.UninstallResult, error)
 	UpdateStatus(context.Context, *rpc.ConnectRequest) *rpc.ConnectInfo
+	WatchWorkloads(context.Context, rpc.Connector_WatchWorkloadsServer) error
 	WithK8sInterface(context.Context) context.Context
 	WorkloadInfoSnapshot(context.Context, *rpc.ListRequest) (*rpc.WorkloadInfoSnapshot, error)
 	ManagerClient() manager.ManagerClient
@@ -433,6 +434,7 @@ func (tm *TrafficManager) getInfosForWorkloads(
 			dlog.Debugf(ctx, "Getting info for %s %s.%s, matching service %s.%s", workload.GetKind(), name, workload.GetNamespace(), svc.Name, svc.Namespace)
 			wlInfo := &rpc.WorkloadInfo{
 				Name:                 name,
+				Namespace:            workload.GetNamespace(),
 				WorkloadResourceType: workload.GetKind(),
 			}
 			var ok bool
@@ -449,6 +451,25 @@ func (tm *TrafficManager) getInfosForWorkloads(
 	})
 	sort.Slice(wis, func(i, j int) bool { return wis[i].Name < wis[j].Name })
 	return wis, nil
+}
+
+func (tm *TrafficManager) WatchWorkloads(c context.Context, stream rpc.Connector_WatchWorkloadsServer) error {
+	snapshotAvailable := tm.wlWatcher.subscribe(c)
+	for {
+		select {
+		case <-c.Done():
+			return nil
+		case <-snapshotAvailable:
+			snapshot, err := tm.WorkloadInfoSnapshot(c, &rpc.ListRequest{Filter: rpc.ListRequest_INTERCEPTABLE})
+			if err != nil {
+				return status.Errorf(codes.Unavailable, "failed to create WorkloadInfoSnapshot: %v", err)
+			}
+			if err := stream.Send(snapshot); err != nil {
+				dlog.Errorf(c, "WatchWorkloads.Send() failed: %v", err)
+				return err
+			}
+		}
+	}
 }
 
 func (tm *TrafficManager) WorkloadInfoSnapshot(ctx context.Context, rq *rpc.ListRequest) (*rpc.WorkloadInfoSnapshot, error) {
